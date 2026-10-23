@@ -1,0 +1,130 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"math/rand"
+	"net/http"
+	"os"
+	"sync"
+	"time"
+)
+
+// MicSeat 代表 9 麥位結構
+type MicSeat struct {
+	SeatID   int    `json:"seat_id"`
+	UserID   string `json:"user_id"`
+	UserName string `json:"user_name"`
+	IsMuted  bool   `json:"is_muted"`
+	IsLocked bool   `json:"is_locked"`
+}
+
+// EggPool 代表防虧損砸蛋水池與保底機制
+type EggPool struct {
+	TotalPool       int64            `json:"total_pool"`       // 當前總水池金額
+	UserSpends      map[string]int64 `json:"user_spends"`      // 用戶累積消耗
+	UserBuffs       map[string]bool  `json:"user_buffs"`       // 50倍變身Buff狀態
+	UserWeeklyGifts map[string]int64 `json:"user_weekly_gifts"` // 每週送禮排行榜
+	mu              sync.Mutex
+}
+
+var (
+	seats [9]MicSeat
+	pool  = EggPool{
+		UserSpends:      make(map[string]int64),
+		UserBuffs:       make(map[string]bool),
+		UserWeeklyGifts: make(map[string]int64),
+	}
+	seatsMu sync.Mutex
+)
+
+func init() {
+	rand.Seed(time.Now().UnixNano())
+	for i := 0; i < 9; i++ {
+		seats[i] = MicSeat{SeatID: i + 1, UserID: "", UserName: "", IsMuted: false, IsLocked: false}
+	}
+}
+
+func main() {
+	// API 路由設定
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "PinKo Voice Chat Backend is Running Successfully!")
+	})
+
+	http.HandleFunc("/api/seats", getSeatsHandler)
+	http.HandleFunc("/api/egg/smash", smashEggHandler)
+	http.HandleFunc("/api/leaderboard", getLeaderboardHandler)
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	log.Printf("Server starting on port %s...", port)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		log.Fatalf("Server failed to start: %v", err)
+	}
+}
+
+// 取得 9 麥位狀態
+func getSeatsHandler(w http.ResponseWriter, r *http.Request) {
+	seatsMu.Lock()
+	defer seatsMu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(seats)
+}
+
+// 防虧損砸蛋與 50 倍保底機制
+func smashEggHandler(w http.ResponseWriter, r *http.Request) {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		userID = "guest_user"
+	}
+
+	cost := int64(100) // 單次砸蛋消耗 100 幣
+	pool.TotalPool += int64(float64(cost) * 0.3) // 30% 注入水池
+	pool.UserSpends[userID] += cost
+	pool.UserWeeklyGifts[userID] += cost
+
+	reward := int64(0)
+	hasBuff := pool.UserBuffs[userID]
+
+	// 防虧損保底與砸蛋機率邏輯
+	if pool.UserSpends[userID] >= 5000 && !hasBuff {
+		pool.UserBuffs[userID] = true
+		reward = cost * 50 // 觸發 50 倍變身保底
+		pool.UserSpends[userID] = 0
+	} else {
+		// 隨機中獎機制，最高不得超過當前水池金額
+		randVal := rand.Intn(100)
+		if randVal < 10 && pool.TotalPool >= cost*5 {
+			reward = cost * 5
+			pool.TotalPool -= reward
+		} else if randVal < 30 {
+			reward = cost * 1
+		}
+	}
+
+	resp := map[string]interface{}{
+		"user_id":     userID,
+		"reward":      reward,
+		"has_buff":    pool.UserBuffs[userID],
+		"total_pool":  pool.TotalPool,
+		"weekly_gift": pool.UserWeeklyGifts[userID],
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// 排行榜 API
+func getLeaderboardHandler(w http.ResponseWriter, r *http.Request) {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(pool.UserWeeklyGifts)
+}
